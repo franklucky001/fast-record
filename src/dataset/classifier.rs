@@ -1,10 +1,11 @@
 use std::collections::{HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, Write, BufReader, BufWriter};
 use std::path::Path;
+use std::process::id;
 use arrow::ipc::writer::FileWriter;
 use std::sync::Arc;
-use arrow::array::{ArrayRef, UInt32Array};
+use arrow::array::{ArrayRef, UInt8Array, UInt32Array};
 use arrow::datatypes::{Schema, Field, DataType};
 use arrow::record_batch::{RecordBatch};
 use rayon::prelude::*;
@@ -90,18 +91,26 @@ impl <'a>ClassifierBuilder<'a> {
 
     pub fn build(&mut self) {
         let base_path = Path::new(&self.args.path);
+        let output_path = match &self.args.output_path{
+            None => base_path,
+            Some(output_path) => Path::new(output_path)
+        };
         let classes_file = base_path.join("class.txt");
         let class_reader = BufReader::new(File::open(classes_file).unwrap());
         let train_samples = self.read_dataset(base_path, "train.txt");
+        println!("total {} samples of train data", train_samples.len());
         self.init(class_reader, &train_samples);
         let train_records = self.build_dataset(train_samples);
         let dev_samples = self.read_dataset(base_path, "dev.txt");
+        println!("total {} samples of dev data", dev_samples.len());
         let dev_records = self.build_dataset(dev_samples);
         let test_samples = self.read_dataset(base_path, "test.txt");
+        println!("total {} samples of test data", test_samples.len());
         let test_records = self.build_dataset(test_samples);
-        self.save_dataset(train_records, base_path, "train.records.ipc");
-        self.save_dataset(dev_records, base_path, "dev.records.ipc");
-        self.save_dataset(test_records, base_path, "test.records.ipc");
+        self.save_vocab(output_path);
+        self.save_dataset(train_records, output_path, "train.records.ipc");
+        self.save_dataset(dev_records, output_path, "dev.records.ipc");
+        self.save_dataset(test_records, output_path, "test.records.ipc");
     }
     fn init(&mut self, class_reader: BufReader<File>, train_samples: & Vec<ClassifierSample>){
         class_reader
@@ -159,10 +168,16 @@ impl <'a>ClassifierBuilder<'a> {
                 }
             }).collect::<Vec<_>>()
     }
-
+    fn save_vocab(&self, output_path: &Path){
+        let vocab_file = File::create(output_path.join("vocab.txt")).expect("create vocab file failed");
+        let mut writer = BufWriter::new(vocab_file);
+        for (word, idx) in &self.vocab{
+            writeln!(&mut writer, "{}\t{}", idx, word).expect("write vocab line failed");
+        }
+    }
     fn save_dataset(&self,
                     records: Vec<ClassifierRecord>,
-                    base_path: &Path,
+                    output_path: &Path,
                     file: & str){
         let max_length = records[0].word_ids.len();
         let mut fields = Vec::new();
@@ -173,7 +188,7 @@ impl <'a>ClassifierBuilder<'a> {
         let field = Field::new("label", DataType::UInt8, false);
         fields.push(field);
         let schema = Arc::new(Schema::new(fields));
-        let record_file = File::open(base_path.join(file)).expect("open record file failed");
+        let record_file = File::create(output_path.join(file)).expect(&format!("create record file {} failed", file));
         let mut writer = FileWriter::try_new(record_file, &schema).expect("create file writer failed");
         for chunk in records.chunks(100){
             let mut values = Vec::new();
@@ -186,9 +201,9 @@ impl <'a>ClassifierBuilder<'a> {
             }
             let label_ids = chunk
                 .iter()
-                .map(|item|item.label_id as u32)
-                .collect::<Vec<u32>>();
-            values.push(Arc::new(UInt32Array::from(label_ids)) as ArrayRef);
+                .map(|item|item.label_id as u8)
+                .collect::<Vec<u8>>();
+            values.push(Arc::new(UInt8Array::from(label_ids)) as ArrayRef);
             let batch = RecordBatch::try_new(schema.clone(), values).expect("build batch error");
             writer.write(&batch).expect("write record error");
         }
