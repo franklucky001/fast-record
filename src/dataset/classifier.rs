@@ -2,7 +2,6 @@ use std::collections::{HashMap};
 use std::fs::File;
 use std::io::{BufRead, Write, BufReader, BufWriter};
 use std::path::Path;
-use std::process::id;
 use arrow::ipc::writer::FileWriter;
 use std::sync::Arc;
 use arrow::array::{ArrayRef, UInt8Array, UInt32Array};
@@ -179,7 +178,7 @@ impl <'a>ClassifierBuilder<'a> {
                     records: Vec<ClassifierRecord>,
                     output_path: &Path,
                     file: & str){
-        let max_length = records[0].word_ids.len();
+        let max_length = self.args.sequence_length;
         let mut fields = Vec::new();
         for k in 0..max_length{
             let field = Field::new(&format!("id_{}", k), DataType::UInt32, false);
@@ -207,5 +206,6 @@ impl <'a>ClassifierBuilder<'a> {
             let batch = RecordBatch::try_new(schema.clone(), values).expect("build batch error");
             writer.write(&batch).expect("write record error");
         }
+        writer.finish().expect("finish write error");
     }
 }
