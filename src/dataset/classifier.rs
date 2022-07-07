@@ -1,4 +1,4 @@
-use std::collections::{HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, Write, BufReader, BufWriter};
 use std::path::Path;
@@ -9,6 +9,8 @@ use arrow::datatypes::{Schema, Field, DataType};
 use arrow::record_batch::{RecordBatch};
 use rayon::prelude::*;
 use clap::Args;
+use crate::dataset::traits::IDataset;
+use indicatif::ProgressBar;
 
 /// classifier args structure
 #[derive(Args, Debug)]
@@ -34,6 +36,9 @@ pub struct ClassifierArgs{
     /// origin sample data use label_id instead of label
     #[clap(long)]
     with_label_id: bool,
+    /// with en language
+    #[clap(long)]
+    with_lang_en: bool,
     /// separator between sentence and label
     #[clap(long, short, visible_alias="delimiter", default_value = "\t")]
     separator: String,
@@ -45,7 +50,7 @@ pub struct ClassifierArgs{
     padding: String,
 }
 
-struct ClassifierRecord {
+pub(crate) struct ClassifierRecord {
     word_ids: Vec<usize>,
     label_id: usize,
 }
@@ -65,7 +70,7 @@ impl ClassifierRecord {
     }
 }
 
-struct ClassifierSample(String, String);
+pub(crate) struct ClassifierSample(String, String);
 
 impl ClassifierSample {
     pub fn new(sent: & str, label: & str) -> Self{
@@ -77,6 +82,7 @@ pub struct ClassifierBuilder<'a>{
     args:&'a ClassifierArgs,
     vocab: HashMap<String, usize>,
     classes: HashMap<String, usize>,
+    stopwords: HashSet<String>,
 }
 
 impl <'a>ClassifierBuilder<'a> {
@@ -85,53 +91,59 @@ impl <'a>ClassifierBuilder<'a> {
             args,
             vocab: HashMap::new(),
             classes: HashMap::new(),
+            stopwords: HashSet::new(),
         }
     }
+}
 
-    pub fn build(&mut self) {
+impl<'a> IDataset<ClassifierSample, ClassifierRecord> for ClassifierBuilder<'a> {
+
+    fn init(&mut self, train_samples: & Vec<ClassifierSample>){
         let base_path = Path::new(&self.args.path);
-        let output_path = match &self.args.output_path{
-            None => base_path,
-            Some(output_path) => Path::new(output_path)
-        };
         let classes_file = base_path.join("class.txt");
         let class_reader = BufReader::new(File::open(classes_file).unwrap());
-        let train_samples = self.read_dataset(base_path, "train.txt");
-        println!("total {} samples of train data", train_samples.len());
-        self.init(class_reader, &train_samples);
-        let train_records = self.build_dataset(train_samples);
-        let dev_samples = self.read_dataset(base_path, "dev.txt");
-        println!("total {} samples of dev data", dev_samples.len());
-        let dev_records = self.build_dataset(dev_samples);
-        let test_samples = self.read_dataset(base_path, "test.txt");
-        println!("total {} samples of test data", test_samples.len());
-        let test_records = self.build_dataset(test_samples);
-        self.save_vocab(output_path);
-        self.save_dataset(train_records, output_path, "train.records.ipc");
-        self.save_dataset(dev_records, output_path, "dev.records.ipc");
-        self.save_dataset(test_records, output_path, "test.records.ipc");
-    }
-    fn init(&mut self, class_reader: BufReader<File>, train_samples: & Vec<ClassifierSample>){
         class_reader
             .lines()
             .filter_map(Result::ok)
-            .map(|line|line)
             .enumerate()
             .for_each(|(i, label)|{
                 self.classes.insert(label, i);
             });
+        if let Some(stopwords_file) = &self.args.stopwords_file{
+            println!("reader stopwords file from {}", stopwords_file);
+            let stopwords_reader = BufReader::new(File::open(stopwords_file).expect("open stopwords file failed"));
+            stopwords_reader
+                .lines()
+                .filter_map(Result::ok)
+                .for_each(|word|{
+                    self.stopwords.insert(word);
+                })
+        }
         self.vocab.insert(self.args.padding.to_owned(), 0);
+        let mut vocab = HashSet::new();
         train_samples
             .iter()
-            .for_each(|item|item.0
-                .chars()
-                .enumerate()
-                .for_each(|(i, ch)|{self.vocab.insert(ch.to_string(), i+1);})
+            .for_each(|item|if self.args.with_lang_en{
+                item.0
+                    .split(' ')
+                    .for_each(|word|{vocab.insert(word.to_string());})
+            }else {
+                item.0
+                    .chars()
+                    .for_each(|ch|{vocab.insert(ch.to_string());})
+            }
             );
+        vocab
+            .into_iter()
+            .filter(|word|!self.stopwords.contains(word))
+            .enumerate()
+            .for_each(|(i, word)|{self.vocab.insert(word, i + 1);});
         let len = self.vocab.len();
         self.vocab.insert(self.args.unknown.to_owned(), len);
     }
-    fn read_dataset(&self, base_path:& Path, file: & str) -> Vec<ClassifierSample>{
+
+    fn read_dataset(&self, file: &str) -> Vec<ClassifierSample> {
+        let base_path = Path::new(&self.args.path);
         let data_file = base_path.join(file);
         let data_reader = BufReader::new(File::open(data_file).unwrap());
         data_reader
@@ -144,19 +156,32 @@ impl <'a>ClassifierBuilder<'a> {
             )
             .collect()
     }
-    fn build_dataset(&self, samples: Vec<ClassifierSample>) -> Vec<ClassifierRecord>{
+
+    fn build_dataset(&self, samples: Vec<ClassifierSample>) -> Vec<ClassifierRecord> {
         let max_length = self.args.sequence_length;
         let unk_id = self.vocab.get(&self.args.unknown).unwrap();
-        samples
+        let pb = ProgressBar::new(samples.len() as u64);
+        let records = samples
             .into_par_iter()
             .map(|sample|{
-                let word_ids = sample.0
-                    .chars()
-                    .map(|ch|self.vocab
-                        .get(&ch.to_string()).map(|it| * it)
-                        .unwrap_or(*unk_id)
-                    ).collect::<Vec<_>>();
-                (word_ids, sample.1)
+                pb.inc(1);
+                if self.args.with_lang_en{
+                    let word_ids = sample.0
+                        .split(' ')
+                        .map(|word| self.vocab
+                            .get(word).map(|it| *it)
+                            .unwrap_or(*unk_id)
+                        ).collect::<Vec<_>>();
+                    (word_ids, sample.1)
+                }else {
+                    let word_ids = sample.0
+                        .chars()
+                        .map(|ch| self.vocab
+                            .get(&ch.to_string()).map(|it| *it)
+                            .unwrap_or(*unk_id)
+                        ).collect::<Vec<_>>();
+                    (word_ids, sample.1)
+                }
             })
             .map(|(word_ids, label)|{
                 if self.args.with_label_id{
@@ -165,29 +190,22 @@ impl <'a>ClassifierBuilder<'a> {
                     let label_id = self.classes.get(&label).unwrap();
                     ClassifierRecord::new(word_ids, *label_id, max_length)
                 }
-            }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>();
+        pb.finish_with_message("done");
+        records
     }
-    fn save_vocab(&self, output_path: &Path){
-        let vocab_file = File::create(output_path.join("vocab.txt")).expect("create vocab file failed");
-        let mut writer = BufWriter::new(vocab_file);
-        for (word, idx) in &self.vocab{
-            writeln!(&mut writer, "{}\t{}", idx, word).expect("write vocab line failed");
-        }
-    }
-    fn save_dataset(&self,
-                    records: Vec<ClassifierRecord>,
-                    output_path: &Path,
-                    file: & str){
+    fn save_dataset(&self, records: Vec<ClassifierRecord>, record_file: &str) {
+        let output_path = self.get_output_path();
         let max_length = self.args.sequence_length;
         let mut fields = Vec::new();
         for k in 0..max_length{
-            let field = Field::new(&format!("id_{}", k), DataType::UInt32, false);
+            let field = Field::new(&format!("word_{}", k), DataType::UInt32, false);
             fields.push(field);
         }
-        let field = Field::new("label", DataType::UInt8, false);
+        let field = Field::new("class", DataType::UInt8, false);
         fields.push(field);
         let schema = Arc::new(Schema::new(fields));
-        let record_file = File::create(output_path.join(file)).expect(&format!("create record file {} failed", file));
+        let record_file = File::create(output_path.join(record_file)).expect(&format!("create record file {} failed", record_file));
         let mut writer = FileWriter::try_new(record_file, &schema).expect("create file writer failed");
         for chunk in records.chunks(100){
             let mut values = Vec::new();
@@ -206,6 +224,20 @@ impl <'a>ClassifierBuilder<'a> {
             let batch = RecordBatch::try_new(schema.clone(), values).expect("build batch error");
             writer.write(&batch).expect("write record error");
         }
-        writer.finish().expect("finish write error");
+        writer.finish().expect("finish write records error");
+    }
+    fn save_vocab(&self){
+        let output_path = self.get_output_path();
+        let vocab_file = File::create(output_path.join("vocab.txt")).expect("create vocab file failed");
+        let mut writer = BufWriter::new(vocab_file);
+        for (word, idx) in &self.vocab{
+            writeln!(&mut writer, "{}\t{}", idx, word).expect("write vocab line failed");
+        }
+    }
+    fn get_output_path(&self) -> &Path {
+        match &self.args.output_path{
+            None => Path::new(&self.args.path),
+            Some(output_path) => Path::new(output_path)
+        }
     }
 }

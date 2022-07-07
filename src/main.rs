@@ -1,6 +1,8 @@
 mod dataset;
 use clap::{Parser, Subcommand};
 use dataset::{ClassifierArgs, ClassifierBuilder, SimilarityArgs, TaggingArgs};
+use crate::dataset::{SimilarityBuilder, TaggingBuilder};
+use crate::dataset::IDataset;
 
 /// Record builder for NLP task
 #[derive(Parser)]
@@ -38,9 +40,13 @@ fn main() {
         },
         Command::Similarity(args) => {
             println!("similarity dataset args: {:?}", args);
+            let mut builder = SimilarityBuilder::new(args);
+            builder.build();
         },
         Command::Tagging(args) => {
-            print!("tagging dataset args: {:?}", args);
+            println!("tagging dataset args: {:?}", args);
+            let mut builder = TaggingBuilder::new(args);
+            builder.build();
         },
         Command::Help => ()
     }
