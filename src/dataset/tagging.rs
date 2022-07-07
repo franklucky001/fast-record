@@ -100,6 +100,14 @@ impl<'a> TaggingBuilder<'a> {
             stopwords: HashSet::new(),
         }
     }
+    fn save_tags(&self){
+        let output_path = self.get_output_path();
+        let tag_file = File::create(output_path.join("tags.txt")).expect("create tags file failed");
+        let mut writer = BufWriter::new(tag_file);
+        for (tag, idx) in &self.tags{
+            writeln!(&mut writer, "{}:{}", idx, tag).expect("write vocab line failed");
+        }
+    }
 }
 
 impl <'a> IDataset<TaggingSample, TaggingRecord> for TaggingBuilder<'a> {
@@ -136,6 +144,7 @@ impl <'a> IDataset<TaggingSample, TaggingRecord> for TaggingBuilder<'a> {
             .for_each(|(i, word)|{self.vocab.insert(word, i + 1);});
         self.tags.insert(self.args.padding_tag.to_owned(), 0);
         tags.into_iter().enumerate().for_each(|(i, tag)|{self.tags.insert(tag, i + 1);});
+        self.save_tags();
         let len = self.vocab.len();
         self.vocab.insert(self.args.unknown.to_owned(), len);
     }
